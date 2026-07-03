@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Generative Rhythm Layers</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #1e1e2f; color: #eee; display: flex; flex-direction: column; align-items: center; padding: 2rem; }
+    .controls { display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; justify-content: center; }
+    button { padding: 0.6rem 1.5rem; font-size: 1rem; border: none; border-radius: 8px; background: #4a4a8a; color: white; cursor: pointer; }
+    button:hover { background: #5f5faa; }
+    input[type=range] { width: 120px; }
+    label { font-size: 0.9rem; }
+    .info { max-width: 600px; text-align: center; font-size: 0.85rem; opacity: 0.7; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h2>Generative Rhythm Layers</h2>
+  <div class="controls">
+    <button id="startStop">▶ Start</button>
+    <label>BPM <input type="range" id="bpm" min="60" max="180" value="120"></label>
+    <span id="bpmValue">120</span>
+  </div>
+  <div class="info">Kick · Hi‑hat · Synth bassline — patterns mutate every 8 bars.</div>
+
+  <script>
+    (function() {
+      // ---- Audio context & master chain ----
+      let audioCtx = null;
+      let masterGain, compressor;
+      let isPlaying = false;
+      let schedulerInterval = null;
+      let nextSched16th = 0;          // next 16th‑note index to schedule
+      const lookAhead = 0.2;          // seconds to schedule ahead
+      const scheduleInterval = 25;    // ms between scheduler checks
+      let bpm = 120;
+      let sixteenthDuration = 60 / bpm / 4;  // seconds per 16th note
+
+      // ---- Persistent nodes (created once) ----
+      let kickGain, kickFilter;        // kick uses its own chain
+      let hatGain, hatFilter;
+      let synthGain, synthFilter, synthDelay, synthFeedback;
+      let noiseBuffer = null;
+
+      // ---- Layer state ----
+      // Patterns: 16 steps each (1 = trigger, 0 = rest). We interpret them differently per layer.
+      let kickPattern =   [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0]; // quarter notes
+      let hatPattern =    [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0]; // 8th notes
+      let synthPattern =  [1,0,0,0, 1,0,1,0, 0,0,1,0, 1,0,0,0]; // bassline rhythm
+
+      // Synth pitches: indices into a pentatonic scale (A2=110, C3=130.81, D3=146.83, E3=164.81, G3=196)
+      const scale = [110, 130.81, 146.83, 164.81, 196.00];
+      let synthNotes =    [0,0,0,0, 2,0,1,0, 0,0,3,0, 1,0,0,0]; // note index, 0..4, ignored if step=0
+      let mutationCounter = 0;
+      const MUTATION_BARS = 8;        // mutate every 8 bars (128 steps)
+
+      // Probability of actually triggering a sound when pattern says 1 (0 = never, 1 = always)
+      const kickProb = 1.0;
+      const hatProb = 0.9;
+      const synthProb = 0.95;
+
+      // ---- Initialise audio graph ----
+      function initAudio() {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        masterGain = audioCtx.createGain();
+        masterGain.gain.value = 0.7;
+        compressor = audioCtx.createDynamicsCompressor();
+        compressor.threshold.value = -24;
+        compressor.knee.value = 30;
+        compressor.ratio.value = 12;
+        compressor.attack.value = 0.003;
+        compressor.release.value = 0.25;
+        masterGain.connect(compressor).connect(audioCtx.destination);
+
+        // Kick chain: gain envelope → low‑pass filter (for body) → master
+        kickGain = audioCtx.createGain();
+        kickFilter = audioCtx.createBiquadFilter();
+        kickFilter.type = 'lowpass';
+        kickFilter.frequency.value = 400;
+        kickFilter.Q.value = 0.5;
+        kickGain.connect(kickFilter).connect(compressor);
+
+        // Hi‑hat chain: gain envelope → band‑pass filter → master
+        hatGain = audioCtx.createGain();
+        hatFilter = audioCtx.createBiquadFilter();
+        hatFilter.type = 'bandpass';
+        hatFilter.frequency.value = 8000;
+        hatFilter.Q.value = 1.5;
+        hatGain.connect(hatFilter).connect(compressor);
+
+        // Synth chain: gain → low‑pass filter → delay (feedback) → master
+        synthGain = audioCtx.createGain();
+        synthFilter = audioCtx.createBiquadFilter();
+        synthFilter.type = 'lowpass';
+        synthFilter.frequency.value = 500;
+        synthFilter.Q.value = 1.0;
+        synthDelay = audioCtx.createDelay(1.0);
+        synthFeedback = audioCtx.createGain();
+        synthFeedback.gain.value = 0.3;
+        synthDelay.delayTime.value = 60 / bpm * 0.75; // dotted 8th
+        synthGain.connect(synthFilter);
+        synthFilter.connect(compressor);           // dry
+        synthFilter.connect(synthDelay);
+        synthDelay.connect(synthFeedback);
+        synthFeedback.connect(synthDelay);
+        synthDelay.connect(compressor);            // wet
+
+        // Generate noise buffer for hi‑hat
+        noiseBuffer = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.2, audioCtx.sampleRate);
+        const data = noiseBuffer.getChannelData(0);
+        for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+      }
+
+      // ---- Sound triggering functions (called at precise audio time) ----
+      function playKick(time) {
+        const osc = audioCtx.createOscillator();
+        const env = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(150, time);
+        osc.frequency.exponentialRampToValueAtTime(40, time + 0.08);
+        osc.frequency.linearRampToValueAtTime(30, time + 0.15);
+        env.gain.setValueAtTime(0, time);
+        env.gain.linearRampToValueAtTime(1, time + 0.005);
+        env.gain.exponentialRampToValueAtTime(0.001, time + 0.15);
+        osc.connect(env);
+        env.connect(kickGain);
+        osc.start(time);
+        osc.stop(time + 0.2);
+      }
+
+      function playHihat(time, stepIndex) {
+        const src = audioCtx.createBufferSource();
+        src.buffer = noiseBuffer;
+        const env = audioCtx.createGain();
+        // Slight filter modulation per step
+        hatFilter.frequency.setValueAtTime(7000 + Math.random() * 2000, time);
+        // Open hat on off‑beats (odd steps)
+        if (stepIndex % 2 === 1) {
+          hatFilter.frequency.linearRampToValueAtTime(10000, time + 0.02);
+        }
+        env.gain.setValueAtTime(0, time);
+        env.gain.linearRampToValueAtTime(0.6, time + 0.002);
+        env.gain.exponentialRampToValueAtTime(0.001, time + 0.08);
+        src.connect(env);
+        env.connect(hatGain);
+        src.start(time);
+        src.stop(time + 0.15);
+      }
+
+      function playSynth(time, noteIndex) {
+        // Two detuned saw oscillators
+        const osc1 = audioCtx.createOscillator();
+        const osc2 = audioCtx.createOscillator();
+        const env = audioCtx.createGain();
+        osc1.type = 'sawtooth';
+        osc2.type = 'sawtooth';
+        const freq = scale[noteIndex % scale.length];
+        osc1.frequency.setValueAtTime(freq, time);
+        osc2.frequency.setValueAtTime(freq * 1.01, time); // slight detune
+        // Filter cutoff: base + LFO + random jitter
+        const lfo = Math.sin(time * 2 * Math.PI * 0.15) * 150;  // slow LFO
+        const jitter = (Math.random() - 0.5) * 200;
+        const cutoff = Math.max(200, Math.min(2000, 500 + lfo + jitter));
+        synthFilter.frequency.setValueAtTime(cutoff, time);
+        synthFilter.frequency.linearRampToValueAtTime(cutoff + 100, time + sixteenthDuration * 0.5);
+
+        env.gain.setValueAtTime(0, time);
+        env.gain.linearRampToValueAtTime(0.5, time + 0.02);
+        env.gain.exponentialRampToValueAtTime(0.001, time + 0.4);
+        osc1.connect(env);
+        osc2.connect(env);
+        env.connect(synthGain);
+        osc1.start(time);
+        osc2.start(time);
+        osc1.stop(time + 0.5);
+        osc2.stop(time + 0.5);
+      }
+
+      // ---- Schedule upcoming 16th‑note steps ----
+      function scheduler() {
+        if (!isPlaying) return;
+        const now = audioCtx.currentTime;
+        // Schedule steps until we reach the look‑ahead
+        while (nextSched16th * sixteenthDuration < now + lookAhead) {
+          const stepTime = nextSched16th * sixteenthDuration;
+          const stepIdx = nextSched16th % 16;
+
+          // KICK: pattern says 1 on quarters, add probability skip
+          if (kickPattern[stepIdx] === 1 && Math.random() < kickProb) {
+            playKick(stepTime);
+          }
+
+          // HI‑HAT: pattern 8th notes, probability skip
+          if (hatPattern[stepIdx] === 1 && Math.random() < hatProb) {
+            playHihat(stepTime, stepIdx);
+          }
+
+          // SYNTH: pattern rhythm, probability skip, use stored note
+          if (synthPattern[stepIdx] === 1 && Math.random() < synthProb) {
+            const note = synthNotes[stepIdx] || 0;
+            playSynth(stepTime, note);
+          }
+
+          nextSched16th++;
+        }
+        // Mutate patterns every MUTATION_BARS
+        if (Math.floor(nextSched16th / 16) > mutationCounter) {
+          mutationCounter = Math.floor(nextSched16th / 16);
+          if (mutationCounter % MUTATION_BARS === 0) {
+            mutatePatterns();
+          }
+        }
+      }
+
+      function mutatePatterns() {
+        // Kick: occasionally toggle a weak beat (step 4,8,12)
+        const weakBeats = [4,8,12];
+        const toggleIdx = weakBeats[Math.floor(Math.random() * weakBeats.length)];
+        kickPattern[toggleIdx] = kickPattern[toggleIdx] === 1 ? 0 : 1;
+
+        // Hi‑hat: shift open‑hat emphasis by moving a single 1 to a neighbour
+        const pos = Math.floor(Math.random() * 16);
+        if (hatPattern[pos] === 1 && Math.random() < 0.4) {
+          const shift = Math.random() < 0.5 ? -1 : 1;
+          const newPos = (pos + shift + 16) % 16;
+          hatPattern[pos] = 0;
+          hatPattern[newPos] = 1;
+        }
+
+        // Synth: pick a random step, toggle between rest and note
+        const sPos = Math.floor(Math.random() * 16);
+        if (synthPattern[sPos] === 1) {
+          synthPattern[sPos] = 0;   // become rest
+        } else {
+          synthPattern[sPos] = 1;
+          synthNotes[sPos] = Math.floor(Math.random() * scale.length);
+        }
+      }
+
+      // ---- Transport control ----
+      function start() {
+        if (!audioCtx) initAudio();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        isPlaying = true;
+        // Reset schedule position to current time
+        const now = audioCtx.currentTime;
+        sixteenthDuration = 60 / bpm / 4;
+        nextSched16th = Math.floor(now / sixteenthDuration);
+        mutationCounter = Math.floor(nextSched16th / 16);
+        schedulerInterval = setInterval(scheduler, scheduleInterval);
+        document.getElementById('startStop').textContent = '⏸ Stop';
+      }
+
+      function stop() {
+        isPlaying = false;
+        clearInterval(schedulerInterval);
+        schedulerInterval = null;
+        document.getElementById('startStop').textContent = '▶ Start';
+      }
+
+      // ---- UI ----
+      document.getElementById('startStop').addEventListener('click', () => {
+        if (isPlaying) stop();
+        else start();
+      });
+
+      const bpmSlider = document.getElementById('bpm');
+      const bpmDisplay = document.getElementById('bpmValue');
+      bpmSlider.addEventListener('input', (e) => {
+        bpm = parseInt(e.target.value, 10);
+        bpmDisplay.textContent = bpm;
+        sixteenthDuration = 60 / bpm / 4;
+        if (synthDelay) synthDelay.delayTime.value = 60 / bpm * 0.75;
+      });
+
+      // Stop if page hidden (optional)
+      window.addEventListener('beforeunload', stop);
+    })();
+  </script>
+</body>
+</html>
